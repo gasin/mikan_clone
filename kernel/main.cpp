@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "frame_buffer_config.hpp"
+#include "memory_map.hpp"
 #include "graphics.hpp"
 #include "mouse.hpp"
 #include "font.hpp"
@@ -26,6 +27,9 @@
 #include "interrupt.hpp"
 #include "asmfunc.h"
 #include "queue.hpp"
+#include "segment.hpp"
+#include "paging.hpp"
+#include "memory_manager.hpp"
 
 const PixelColor kDesktopBGColor{45, 118, 237};
 const PixelColor kDesktopFGColor{255, 255, 255};
@@ -48,6 +52,11 @@ int printk(const char* format, ...) {
   console->PutString(s);
   return result;
 }
+
+// #@@range_begin(memman_buf)
+char memory_manager_buf[sizeof(BitmapMemoryManager)];
+BitmapMemoryManager* memory_manager;
+// #@@range_end(memman_buf)
 
 char mouse_cursor_buf[sizeof(MouseCursor)];
 MouseCursor* mouse_cursor;
@@ -79,7 +88,6 @@ void SwitchEhci2Xhci(const pci::Device& xhc_dev) {
 
 usb::xhci::Controller* xhc;
 
-// #@@range_begin(queue_message)
 struct Message {
   enum Type {
     kInterruptXHCI,
@@ -87,17 +95,21 @@ struct Message {
 };
 
 ArrayQueue<Message>* main_queue;
-// #@@range_end(queue_message)
 
-// #@@range_begin(xhci_handler)
 __attribute__((interrupt))
 void IntHandlerXHCI(InterruptFrame* frame) {
   main_queue->Push(Message{Message::kInterruptXHCI});
   NotifyEndOfInterrupt();
 }
-// #@@range_end(xhci_handler)
 
-extern "C" void KernelMain(const FrameBufferConfig& frame_buffer_config) {
+alignas(16) uint8_t kernel_main_stack[1024 * 1024];
+
+extern "C" void KernelMainNewStack(
+    const FrameBufferConfig& frame_buffer_config_ref,
+    const MemoryMap& memory_map_ref) {
+  FrameBufferConfig frame_buffer_config{frame_buffer_config_ref};
+  MemoryMap memory_map{memory_map_ref};
+
   switch (frame_buffer_config.pixel_format) {
     case kPixelRGBResv8BitPerColor:
       pixel_writer = new(pixel_writer_buf)
@@ -134,6 +146,43 @@ extern "C" void KernelMain(const FrameBufferConfig& frame_buffer_config) {
   };
   printk("Welcome to MikanOS!\n");
   SetLogLevel(kWarn);
+
+  SetupSegments();
+
+  const uint16_t kernel_cs = 1 << 3;
+  const uint16_t kernel_ss = 2 << 3;
+  SetDSAll(0);
+  SetCSSS(kernel_cs, kernel_ss);
+
+  SetupIdentityPageTable();
+
+  // #@@range_begin(mark_allocated)
+  ::memory_manager = new(memory_manager_buf) BitmapMemoryManager;
+
+  const auto memory_map_base = reinterpret_cast<uintptr_t>(memory_map.buffer);
+  uintptr_t available_end = 0;
+  for (uintptr_t iter = memory_map_base;
+       iter < memory_map_base + memory_map.map_size;
+       iter += memory_map.descriptor_size) {
+    auto desc = reinterpret_cast<const MemoryDescriptor*>(iter);
+    if (available_end < desc->physical_start) {
+      memory_manager->MarkAllocated(
+          FrameID{available_end / kBytesPerFrame},
+          (desc->physical_start - available_end) / kBytesPerFrame);
+    }
+
+    const auto physical_end =
+      desc->physical_start + desc->number_of_pages * kUEFIPageSize;
+    if (IsAvailable(static_cast<MemoryType>(desc->type))) {
+      available_end = physical_end;
+    } else {
+      memory_manager->MarkAllocated(
+          FrameID{desc->physical_start / kBytesPerFrame},
+          desc->number_of_pages * kUEFIPageSize / kBytesPerFrame);
+    }
+  }
+  memory_manager->SetMemoryRange(FrameID{1}, FrameID{available_end / kBytesPerFrame});
+  // #@@range_end(mark_allocated)
 
   mouse_cursor = new(mouse_cursor_buf) MouseCursor{
     pixel_writer, kDesktopBGColor, {300, 200}
@@ -172,9 +221,8 @@ extern "C" void KernelMain(const FrameBufferConfig& frame_buffer_config) {
         xhc_dev->bus, xhc_dev->device, xhc_dev->function);
   }
 
-  const uint16_t cs = GetCS();
   SetIDTEntry(idt[InterruptVector::kXHCI], MakeIDTAttr(DescriptorType::kInterruptGate, 0),
-              reinterpret_cast<uint64_t>(IntHandlerXHCI), cs);
+              reinterpret_cast<uint64_t>(IntHandlerXHCI), kernel_cs);
   LoadIDT(sizeof(idt) - 1, reinterpret_cast<uintptr_t>(&idt[0]));
 
   const uint8_t bsp_local_apic_id =
@@ -219,9 +267,7 @@ extern "C" void KernelMain(const FrameBufferConfig& frame_buffer_config) {
     }
   }
 
-  // #@@range_begin(event_loop)
   while (true) {
-    // #@@range_begin(get_front_message)
     __asm__("cli");
     if (main_queue.Count() == 0) {
       __asm__("sti\n\thlt");
@@ -231,7 +277,6 @@ extern "C" void KernelMain(const FrameBufferConfig& frame_buffer_config) {
     Message msg = main_queue.Front();
     main_queue.Pop();
     __asm__("sti");
-    // #@@range_end(get_front_message)
 
     switch (msg.type) {
     case Message::kInterruptXHCI:
@@ -246,7 +291,6 @@ extern "C" void KernelMain(const FrameBufferConfig& frame_buffer_config) {
       Log(kError, "Unknown message type: %d\n", msg.type);
     }
   }
-  // #@@range_end(event_loop)
 }
 
 extern "C" void __cxa_pure_virtual() {
